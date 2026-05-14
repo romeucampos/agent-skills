@@ -73,7 +73,6 @@ Open any AI coding agent (Claude Code, Codex, etc.) in this repo and ask it to "
 
 > [!NOTE]
 > Setup is idempotent. Already-configured agents are skipped on re-run. You can run setup again later to add new agents, repair drift, or check status.
-
 ### 3. Commit Your Skills
 
 Add this note at the top of your repo's `README.md` for future reference:
@@ -125,7 +124,7 @@ For each selected agent:
 
 - If the system skills directory has content, the script backs it up under `.agent-skills-setup/backup/<agent>/` and imports it into the matching repo folder.
 - If the system directory is missing or empty, the script creates an empty repo folder.
-- If repo and system both already have content (a re-run scenario), the script merges non-conflicting system entries into the repo and preserves the rest in the backup.
+- If repo and system both already have content, the script stops on that agent and asks you to resolve it manually (pick one as source of truth, clear the other, re-run).
 - The script replaces the system skills directory with a symlink pointing back to the repo folder.
 - Already-configured agents are skipped automatically.
 
