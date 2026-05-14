@@ -4,7 +4,7 @@ A central, version-controlled home for coding agent skills across multiple tools
 
 > With ❤️ from [ZazenCodes](https://zazencodes.com/)
 
-> [!NOTE]   
+> [!NOTE]
 > This setup currently supports macOS and Linux only.
 
 ## Benefits
@@ -20,8 +20,12 @@ A central, version-controlled home for coding agent skills across multiple tools
 
 When you run `setup_symlinks.py` it will:
 
-1. Copy your current system skills into this repo.
-2. Replace each system skills directory with a symlink back to the corresponding folder in this repo.
+1. Ask which agents you want to manage. `agents/` and `claude/` are always included.
+2. Back up your current system skills directories.
+3. Copy them into this repo.
+4. Replace each system skills directory with a symlink back to the matching folder in this repo.
+
+`agents/` is the canonical user-skill folder and maps to `~/.agents/skills`. `claude/` is a required mirror that maps to `~/.claude/skills` because Claude Code doesn't read `~/.agents/skills`. Other agents (`codex`, `copilot`, `cursor`, `gemini`) are optional and you opt into them during setup.
 
 ## Setup
 
@@ -33,8 +37,8 @@ Open [this repository on GitHub](https://github.com/zazencodes/agent-skills) and
 the ["Use this template" button](https://docs.github.com/en/repositories/creating-and-managing-repositories/creating-a-repository-from-a-template#creating-a-repository-from-a-template) to create a new private repository in your own
 account or organization.
 
-> [!INFO]   
-> This button is right next to the "Star" button, so you may as well click that one too ⭐   
+> [!TIP]
+> The "Use this template" button is right next to the "Star" button, so you may as well click that one too ⭐
 > Thank you. It really helps me out.
 
 Then clone your new private repo:
@@ -44,27 +48,31 @@ git clone <your-private-repo-url>
 cd agent-skills
 ```
 
-### 2. Run the setup
+### 2. Choose your setup style
 
-> [!CAUTION]   
-> After running this script, your agent skills will live here in this repo. Your system skills directories will become symlinks. It's not dangerous, but it's important for you to understand this.
+You have two ways to drive setup:
+
+**A. Run the script directly** (classic flow):
 
 ```sh
-# Run the preview
-python setup_symlinks.py --dry-run
+# Preview without changing anything
+python3 setup_symlinks.py --dry-run
 
-# Run the setup
-python setup_symlinks.py
+# Run the interactive setup
+python3 setup_symlinks.py
 ```
 
-> [!NOTE]   
-> Before setup:
-> 
-> - `claude/`, `codex/`, `copilot/`, `cursor/`, and `gemini/` should be missing or empty.
-> - None of the system skill directories should already be symlinks.
-> 
-> If the script finds existing repo skills or existing symlinks, it will stop and tell you exactly which paths you need to remove first.
+The script walks you through agent selection, prints a plan per agent, and asks you to confirm before changing anything.
 
+**B. Let an agent drive it for you** (vibe flow):
+
+Open any AI coding agent (Claude Code, Codex, etc.) in this repo and ask it to "set up agent skills." The agent will pick up the project-local `agent-skills-setup-manager` skill (shipped at `.agents/skills/agent-skills-setup-manager/` and `.claude/skills/agent-skills-setup-manager/`) and walk you through the flow conversationally — choosing agents, running the script, checking status, and adding more agents later.
+
+> [!CAUTION]
+> After running setup, your agent skills will live here in this repo. Your system skills directories will become symlinks. It's not dangerous, but it's important for you to understand this.
+
+> [!NOTE]
+> Setup is idempotent. Already-configured agents are skipped on re-run. You can run setup again later to add new agents, repair drift, or check status.
 
 ### 3. Commit Your Skills
 
@@ -78,11 +86,11 @@ This repository was created from the [ZazenCodes Agent Skills](https://github.co
 My agent skills live here and my agent skill system directories are symlinked to this repo.
 ```
 
-Stage and commit the changes:
+Stage and commit:
 
 ```sh
 git status
-git add README.md claude codex copilot cursor gemini
+git add README.md agents claude
 git commit -m "Initial commit of agent skills after setup"
 git push
 ```
@@ -93,34 +101,38 @@ Congratulations! You now have your own agent skills monorepo and you're ready to
 
 ### Is this safe?
 
-- This repository intentionally starts with no skills. Third-party skills in a repository like this would be a huge security risk.
-- There is built-in [disaster recovery](#backups-and-recovery). When you run `setup_symlinks.py` it first creates backups of your current agent skills under `.agent-skills-setup/backup/`.
+- This repository ships with empty top-level agent folders. The only skill it contains is `agent-skills-setup-manager`, scoped to this repo at `.agents/skills/` and `.claude/skills/`, which exists to help agents drive this repo's setup. Third-party skills in a template repo would be a security risk.
+- Built-in [disaster recovery](#disaster-recovery): `setup_symlinks.py` creates per-agent backups under `.agent-skills-setup/backup/` before changing anything.
 
 ### Supported Agent Mappings
 
+| Tool | System skill directory | Repo folder | Default? |
+| --- | --- | --- | --- |
+| Codex / AGENTS.md ecosystem | `~/.agents/skills/` | `./agents` | Required |
+| Claude Code | `~/.claude/skills/` | `./claude` | Required |
+| OpenAI Codex system skills | `~/.codex/skills/` | `./codex` | Optional |
+| GitHub Copilot | `~/.copilot/skills/` | `./copilot` | Optional |
+| Cursor | `~/.cursor/skills/` | `./cursor` | Optional |
+| Google Antigravity | `~/.gemini/antigravity/skills/` | `./gemini` | Optional |
 
-| Tool | System skill directory | Repo folder |
-| --- | --- | --- |
-| Claude Code | `~/.claude/skills/` | `./claude` |
-| OpenAI Codex | `~/.codex/skills/` | `./codex` |
-| GitHub Copilot | `~/.copilot/skills/` | `./copilot` |
-| Cursor | `~/.cursor/skills/` | `./cursor` |
-| Google Antigravity | `~/.gemini/antigravity/skills/` | `./gemini` |
+`agents/` is the canonical user-skill folder. `claude/` is a required mirror because Claude Code reads from `~/.claude/skills` rather than `~/.agents/skills`. The `codex/` folder is reserved for Codex system-skill content (e.g. `.system/`); put Codex user skills in `agents/` instead.
 
+By convention, when you ask an agent to add a new skill, it should ask whether to install into `agents/`, `claude/`, or both. You can pin a default by editing `AGENTS.md`.
 
 ### What Setup Does
 
-For each agent:
+For each selected agent:
 
-- If the system skills directory exists, the script backs it up under `.agent-skills-setup/backup/<agent>/`.
-- It then copies that directory into the matching repo folder.
-- If a system skills directory does not exist, the script creates an empty repo folder for that agent.
+- If the system skills directory has content, the script backs it up under `.agent-skills-setup/backup/<agent>/` and imports it into the matching repo folder.
+- If the system directory is missing or empty, the script creates an empty repo folder.
+- If repo and system both already have content (a re-run scenario), the script merges non-conflicting system entries into the repo and preserves the rest in the backup.
 - The script replaces the system skills directory with a symlink pointing back to the repo folder.
+- Already-configured agents are skipped automatically.
 
 If anything fails partway through:
 
 - The script prints the real traceback first.
-- The script then tells you where the backup folder lives.
+- It then tells you where the backup folder lives.
 - The backup folder contains a `README.md` with recovery steps.
 
 ### Backups
@@ -129,6 +141,16 @@ Backups are stored under `.agent-skills-setup/backup/`.
 
 - Keep them until you have verified everything is working.
 - Read `.agent-skills-setup/backup/README.md` if you need to restore an original system directory.
+
+### Re-running Setup
+
+`setup_symlinks.py` is idempotent. Re-run it any time to:
+
+- Add a new agent to your setup (it remembers your previous selection).
+- Repair drift if a symlink got removed or replaced.
+- Run `python3 setup_symlinks.py --status` to see the current topology without changing anything.
+
+The `agent-skills-setup-manager` skill is the recommended way to drive these flows once you're set up — just ask an agent for help.
 
 ### Disaster Recovery
 

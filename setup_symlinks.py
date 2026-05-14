@@ -1,9 +1,127 @@
 import argparse
+import json
 import shutil
 import sys
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
+
+try:
+    import termios
+    import tty
+except ImportError:  # non-Unix
+    termios = None
+    tty = None
+
+
+def _read_key(stream) -> str:
+    """Read one keystroke (or escape sequence) from a cbreak-mode stdin."""
+    ch = stream.read(1)
+    if ch != "\x1b":
+        return ch
+    # Possible escape sequence; read the rest if present.
+    seq = ch
+    nxt = stream.read(1)
+    if not nxt:
+        return seq
+    seq += nxt
+    if nxt == "[":
+        while True:
+            c = stream.read(1)
+            if not c:
+                break
+            seq += c
+            if c.isalpha() or c == "~":
+                break
+    return seq
+
+
+def multiselect_checkbox(
+    title: str,
+    items: list[tuple[str, str, bool]],
+    preselected: set[str],
+) -> list[str]:
+    """Interactive checkbox prompt.
+
+    items: list of (key, description, locked) tuples. Locked items cannot be toggled.
+    preselected: keys to start checked. Locked items are auto-checked regardless.
+    Returns the list of selected keys in the order they appear in `items`.
+
+    Falls back to a plain non-interactive listing if stdin is not a TTY or termios
+    is unavailable.
+    """
+    locked_keys = {k for k, _d, locked in items if locked}
+    selected: set[str] = set(preselected) | locked_keys
+    keys = [k for k, _d, _l in items]
+
+    is_tty = sys.stdin.isatty() and sys.stdout.isatty() and termios is not None
+    if not is_tty:
+        # Non-interactive fallback: keep required + preselected, print and continue.
+        print(title)
+        for key, desc, locked in items:
+            mark = "x" if key in selected else " "
+            tag = " (required)" if locked else ""
+            print(f"  [{mark}] {key:<8} {desc}{tag}")
+        print()
+        return [k for k in keys if k in selected]
+
+    cursor = 0
+    help_line = (
+        "Up/Down or j/k to move, Space to toggle, Enter to confirm, "
+        "q or Ctrl-C to cancel."
+    )
+    total_lines = 2 + len(items)  # title + help + one per item
+
+    def render(first: bool) -> None:
+        out = sys.stdout
+        if not first:
+            out.write(f"\x1b[{total_lines}F")  # move to start of N lines up
+            out.write("\x1b[J")  # clear to end of screen
+        out.write(title + "\n")
+        out.write(help_line + "\n")
+        for i, (key, desc, locked) in enumerate(items):
+            pointer = ">" if i == cursor else " "
+            mark = "x" if key in selected else " "
+            tag = " (required)" if locked else ""
+            out.write(f"{pointer} [{mark}] {key:<8} {desc}{tag}\n")
+        out.flush()
+
+    fd = sys.stdin.fileno()
+    old_attrs = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        render(first=True)
+        while True:
+            key = _read_key(sys.stdin)
+            if key in ("\x1b[A", "k"):  # up
+                cursor = (cursor - 1) % len(items)
+            elif key in ("\x1b[B", "j"):  # down
+                cursor = (cursor + 1) % len(items)
+            elif key == " ":
+                k = keys[cursor]
+                if k in locked_keys:
+                    continue
+                if k in selected:
+                    selected.remove(k)
+                else:
+                    selected.add(k)
+            elif key in ("\r", "\n"):
+                break
+            elif key in ("\x03", "q"):
+                raise KeyboardInterrupt
+            else:
+                continue
+            render(first=False)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+
+    print()
+    return [k for k in keys if k in selected]
+
+
+REQUIRED_AGENTS = ("agents", "claude")
+OPTIONAL_AGENTS = ("codex", "copilot", "cursor", "gemini")
+ALL_AGENTS = REQUIRED_AGENTS + OPTIONAL_AGENTS
 
 
 @dataclass(frozen=True)
@@ -20,14 +138,28 @@ class SetupError(Exception):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Copy each current system skills directory into this repo, back it up, "
-            "and replace the system directory with a symlink back to the repo."
+            "Set up symlinks between this repo and your agent skills directories. "
+            "Idempotent: safe to re-run to add new agents or repair drift."
         )
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Preview the setup without changing files or asking for confirmation.",
+    )
+    parser.add_argument(
+        "--agents",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated list of agents to manage. Skips the interactive selection. "
+            f"'agents' and 'claude' are always included. Optional: {', '.join(OPTIONAL_AGENTS)}."
+        ),
+    )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Print the current symlink topology and exit without making changes.",
     )
     return parser.parse_args()
 
@@ -36,17 +168,21 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parent
 
 
-def build_mappings(root: Path) -> list[AgentMapping]:
+def system_path_for(name: str) -> Path:
     home = Path.home()
-    return [
-        AgentMapping("claude", root / "claude", home / ".claude" / "skills"),
-        AgentMapping("codex", root / "codex", home / ".codex" / "skills"),
-        AgentMapping("copilot", root / "copilot", home / ".copilot" / "skills"),
-        AgentMapping("cursor", root / "cursor", home / ".cursor" / "skills"),
-        AgentMapping(
-            "gemini", root / "gemini", home / ".gemini" / "antigravity" / "skills"
-        ),
-    ]
+    layout = {
+        "claude": home / ".claude" / "skills",
+        "agents": home / ".agents" / "skills",
+        "codex": home / ".codex" / "skills",
+        "copilot": home / ".copilot" / "skills",
+        "cursor": home / ".cursor" / "skills",
+        "gemini": home / ".gemini" / "antigravity" / "skills",
+    }
+    return layout[name]
+
+
+def build_mapping(name: str, root: Path) -> AgentMapping:
+    return AgentMapping(name, root / name, system_path_for(name))
 
 
 def managed_root(root: Path) -> Path:
@@ -63,6 +199,33 @@ def backup_dir(root: Path, agent_name: str) -> Path:
 
 def backup_readme_path(root: Path) -> Path:
     return backup_root(root) / "README.md"
+
+
+def config_path(root: Path) -> Path:
+    return managed_root(root) / "config.json"
+
+
+def load_saved_selection(root: Path) -> list[str] | None:
+    path = config_path(root)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        agents = data.get("agents")
+        if isinstance(agents, list) and all(isinstance(x, str) for x in agents):
+            return [a for a in agents if a in ALL_AGENTS]
+    except (json.JSONDecodeError, OSError):
+        return None
+    return None
+
+
+def save_selection(root: Path, agents: list[str], *, dry_run: bool) -> None:
+    if dry_run:
+        return
+    path = config_path(root)
+    ensure_dir(path.parent)
+    payload = {"agents": agents}
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
 def ensure_dir(path: Path) -> None:
@@ -89,8 +252,6 @@ def iter_entries(path: Path) -> list[Path]:
 
 
 def format_entry_names(entries: list[Path]) -> str:
-    if not entries:
-        return "(empty)"
     return ", ".join(entry.name for entry in entries)
 
 
@@ -113,76 +274,76 @@ def copy_directory(src: Path, dst: Path) -> None:
     remove_path(old_dir)
 
 
-def recreate_empty_directory(path: Path) -> None:
-    remove_path(path)
-    ensure_dir(path)
+def classify_repo(path: Path) -> str:
+    if path.is_symlink():
+        return "symlink"
+    if not path.exists():
+        return "missing"
+    if not path.is_dir():
+        return "not_dir"
+    return "has_skills" if iter_entries(path) else "empty"
+
+
+def classify_system(path: Path, repo_path: Path) -> str:
+    if path.is_symlink():
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return "broken_symlink"
+        return "symlink_to_repo" if resolved == repo_path.resolve() else "symlink_other"
+    if not path.exists():
+        return "missing"
+    if not path.is_dir():
+        return "not_dir"
+    return "has_content" if iter_entries(path) else "empty"
 
 
 def describe_repo_state(path: Path) -> str:
-    if path.is_symlink():
+    state = classify_repo(path)
+    if state == "symlink":
         return f"symlink -> {path.resolve()}"
-    if path.exists() and not path.is_dir():
+    if state == "not_dir":
         return "exists but is not a directory"
-    if not path.exists():
-        return "✓ empty"
-
-    entries = iter_entries(path)
-    if not entries:
-        return "empty directory"
-
-    return f"contains {len(entries)} item(s): {format_entry_names(entries)}"
-
-
-def describe_system_state(path: Path) -> str:
-    if path.is_symlink():
-        return f"symlink -> {path.resolve()}"
-    if path.exists() and not path.is_dir():
-        return "exists but is not a directory"
-    if not path.exists():
+    if state == "missing":
         return "missing"
+    if state == "empty":
+        return "empty directory"
+    entries = iter_entries(path)
+    return f"{len(entries)} item(s): {format_entry_names(entries)}"
 
+
+def describe_system_state(path: Path, repo_path: Path) -> str:
+    state = classify_system(path, repo_path)
+    if state == "symlink_to_repo":
+        return f"symlink -> {repo_path} (configured)"
+    if state == "symlink_other":
+        return f"symlink -> {path.resolve()} (foreign)"
+    if state == "broken_symlink":
+        return "broken symlink"
+    if state == "not_dir":
+        return "exists but is not a directory"
+    if state == "missing":
+        return "missing"
     entries = iter_entries(path)
     return f"directory with {len(entries)} item(s): {format_entry_names(entries)}"
 
 
 def collect_preflight_problems(mappings: list[AgentMapping]) -> list[str]:
+    """Only flags state that the per-agent flow cannot recover from."""
     problems: list[str] = []
-    root = mappings[0].repo_path.parent if mappings else repo_root()
-    existing_backup_root = backup_root(root)
-
-    if existing_backup_root.exists() or existing_backup_root.is_symlink():
-        problems.append(
-            f"Remove the existing backups at {existing_backup_root} before running setup again."
-        )
-        problems.append(f"Remove them with: rm -r {existing_backup_root}")
-
     for mapping in mappings:
-        repo_path = mapping.repo_path
-        system_path = mapping.system_path
-
-        if repo_path.is_symlink():
+        if mapping.repo_path.exists() and not mapping.repo_path.is_dir() and not mapping.repo_path.is_symlink():
             problems.append(
-                f"Remove the repo symlink at {repo_path} before running setup again."
+                f"Remove {mapping.repo_path} because it exists but is not a directory."
             )
-        elif repo_path.exists() and not repo_path.is_dir():
+        if (
+            mapping.system_path.exists()
+            and not mapping.system_path.is_dir()
+            and not mapping.system_path.is_symlink()
+        ):
             problems.append(
-                f"Remove {repo_path} because setup expects that path to be missing or an empty directory."
+                f"Remove {mapping.system_path} because it exists but is not a directory."
             )
-        elif repo_path.exists():
-            for entry in iter_entries(repo_path):
-                problems.append(
-                    f"Remove {entry} because this repo must start with no skills in {repo_path}."
-                )
-
-        if system_path.is_symlink():
-            problems.append(
-                f"Remove the existing system symlink at {system_path} before running setup again."
-            )
-        elif system_path.exists() and not system_path.is_dir():
-            problems.append(
-                f"Remove {system_path} because setup expects that path to be a directory or be missing."
-            )
-
     return problems
 
 
@@ -230,8 +391,8 @@ def write_backup_readme(
             "Example restore commands on macOS or Linux:",
             "",
             "```sh",
-            "rm -rf ~/.codex/skills",
-            "cp -R /path/to/agent-skills/.agent-skills-setup/backup/codex ~/.codex/skills",
+            "rm -rf ~/.agents/skills",
+            "cp -R /path/to/agent-skills/.agent-skills-setup/backup/agents ~/.agents/skills",
             "```",
             "",
             "After you restore a system directory, make sure the matching repo folder is either removed or reset to the state you want before running setup again.",
@@ -248,16 +409,29 @@ def print_intro(root: Path, mappings: list[AgentMapping], *, dry_run: bool) -> N
     print(f"Repo root:   {root}")
     print(f"Backup root: {backup_root(root)}")
     print()
-    print("Current state:")
+    print("Selected agents and current state:")
 
     for mapping in mappings:
         print(f"- {mapping.name}")
-        print(f"  repo path:   {mapping.repo_path}")
-        print(f"  repo state:  {describe_repo_state(mapping.repo_path)}")
-        print(f"  system path: {mapping.system_path}")
-        print(f"  system state: {describe_system_state(mapping.system_path)}")
+        print(f"  repo:   {mapping.repo_path}")
+        print(f"  state:  {describe_repo_state(mapping.repo_path)}")
+        print(f"  system: {mapping.system_path}")
+        print(f"  state:  {describe_system_state(mapping.system_path, mapping.repo_path)}")
 
     print()
+
+
+def print_status(root: Path) -> None:
+    print(f"Repo root: {root}")
+    saved = load_saved_selection(root) or []
+    print(f"Saved selection: {', '.join(saved) if saved else '(none)'}")
+    print()
+    for name in ALL_AGENTS:
+        mapping = build_mapping(name, root)
+        marker = "*" if name in saved else " "
+        print(f"{marker} {name}")
+        print(f"    repo:   {describe_repo_state(mapping.repo_path)}")
+        print(f"    system: {describe_system_state(mapping.system_path, mapping.repo_path)}")
 
 
 def confirm_or_exit(message: str) -> None:
@@ -267,6 +441,62 @@ def confirm_or_exit(message: str) -> None:
 
     print("Setup cancelled. No more changes will be made.")
     raise SystemExit(1)
+
+
+def prompt_agent_selection(saved: list[str] | None) -> list[str]:
+    descriptions = {
+        "agents": "~/.agents/skills",
+        "claude": "~/.claude/skills",
+        "codex": "~/.codex/skills",
+        "copilot": "~/.copilot/skills",
+        "cursor": "~/.cursor/skills",
+        "gemini": "~/.gemini/antigravity/skills",
+    }
+    items: list[tuple[str, str, bool]] = []
+    for name in ALL_AGENTS:
+        locked = name in REQUIRED_AGENTS
+        items.append((name, descriptions[name], locked))
+
+    preselected: set[str] = set(REQUIRED_AGENTS)
+    if saved:
+        preselected.update(saved)
+
+    return multiselect_checkbox(
+        title="Select agents to manage:",
+        items=items,
+        preselected=preselected,
+    )
+
+
+def parse_agents_flag(value: str) -> list[str]:
+    chosen: list[str] = []
+    for token in value.split(","):
+        name = token.strip().lower()
+        if not name:
+            continue
+        if name not in ALL_AGENTS:
+            raise SetupError(f"Unknown agent: {name}")
+        if name not in chosen:
+            chosen.append(name)
+    # Enforce required agents.
+    for required in REQUIRED_AGENTS:
+        if required not in chosen:
+            chosen.append(required)
+    return chosen
+
+
+def determine_selection(args: argparse.Namespace, root: Path) -> list[str]:
+    if args.agents is not None:
+        return parse_agents_flag(args.agents)
+
+    saved = load_saved_selection(root)
+    if saved is not None:
+        print(f"Found saved selection: {', '.join(saved)}")
+        answer = input("Use saved selection? [Y/n] (n = edit): ").strip().lower()
+        if answer in {"", "y", "yes"}:
+            return saved
+
+    return prompt_agent_selection(saved)
 
 
 def rollback_agent(
@@ -292,65 +522,92 @@ def rollback_agent(
     print(f"Rollback finished for {mapping.name}.")
 
 
+def plan_action(mapping: AgentMapping) -> tuple[str, str]:
+    """Return (action, human_description) for the per-agent state."""
+    repo_state = classify_repo(mapping.repo_path)
+    system_state = classify_system(mapping.system_path, mapping.repo_path)
+
+    if system_state == "symlink_to_repo":
+        return "skip_configured", "Already configured (system symlinks into repo)."
+
+    if system_state in {"symlink_other", "broken_symlink"}:
+        return (
+            "skip_foreign",
+            f"System path is a {system_state.replace('_', ' ')}; will not touch.",
+        )
+
+    if repo_state == "symlink":
+        return "skip_repo_symlink", "Repo path is itself a symlink; will not touch."
+
+    if repo_state in {"empty", "missing"} and system_state == "has_content":
+        return "import_and_link", "Back up system dir, import into repo, replace with symlink."
+
+    if repo_state in {"empty", "missing"} and system_state in {"empty", "missing"}:
+        return "link_only", "Create empty repo dir and symlink system path to it."
+
+    if repo_state == "has_skills" and system_state in {"empty", "missing"}:
+        return "adopt_repo", "Repo already has skills; just symlink system path to it."
+
+    if repo_state == "has_skills" and system_state == "has_content":
+        return "conflict", (
+            "Both repo and system already have content. Resolve manually: pick one as "
+            "the source of truth and clear the other before re-running."
+        )
+
+    return "error", f"Unhandled state combo: repo={repo_state}, system={system_state}"
+
+
 def setup_agent(mapping: AgentMapping, root: Path) -> None:
-    repo_path = mapping.repo_path
-    system_path = mapping.system_path
-    agent_backup = backup_dir(root, mapping.name)
+    action, description = plan_action(mapping)
 
-    repo_existed_before = repo_path.exists()
-    system_existed_before = system_path.exists()
-    system_entries = iter_entries(system_path) if system_existed_before else []
+    print(f"== {mapping.name} ==")
+    print(f"Repo:   {mapping.repo_path}  [{describe_repo_state(mapping.repo_path)}]")
+    print(f"System: {mapping.system_path}  [{describe_system_state(mapping.system_path, mapping.repo_path)}]")
+    print(f"Plan:   {description}")
 
-    print(f"== Setting up {mapping.name} ==")
-    print(f"Repo folder:   {repo_path}")
-    print(f"System folder: {system_path}")
+    if action.startswith("skip"):
+        print()
+        return
 
-    if system_existed_before:
-        print(
-            f"I found {len(system_entries)} item(s) in the current system directory: "
-            f"{format_entry_names(system_entries)}"
-        )
-        print(f"I will back that directory up to {agent_backup}.")
-        print(
-            f"I will then copy it into {repo_path} and replace {system_path} with a symlink."
-        )
-    else:
-        print("I did not find an existing system skills directory.")
-        print(f"I will create an empty repo folder at {repo_path}.")
-        print(f"I will then create {system_path} as a symlink back to the repo.")
+    if action in ("error", "conflict"):
+        print("Skipping. Resolve manually and re-run.")
+        print()
+        return
 
     confirm_or_exit(f"Proceed with {mapping.name}?")
 
+    repo_existed_before = mapping.repo_path.exists()
+    system_existed_before = mapping.system_path.exists()
+    agent_backup = backup_dir(root, mapping.name)
+
     try:
-        if system_existed_before:
-            print(f"Creating backup at {agent_backup}...")
-            copy_directory(system_path, agent_backup)
-            print("Backup created.")
+        if action == "import_and_link":
+            if agent_backup.exists():
+                raise SetupError(
+                    f"Backup already exists at {agent_backup}; remove it before re-importing."
+                )
+            print(f"Backing up {mapping.system_path} -> {agent_backup}")
+            copy_directory(mapping.system_path, agent_backup)
+            print(f"Importing into {mapping.repo_path}")
+            copy_directory(mapping.system_path, mapping.repo_path)
+            remove_path(mapping.system_path)
 
-            print(f"Copying the current system skills into {repo_path}...")
-            copy_directory(system_path, repo_path)
-            print("Import complete.")
-        else:
-            print(f"Creating an empty repo directory at {repo_path}...")
-            recreate_empty_directory(repo_path)
-            print("Empty repo directory created.")
+        elif action == "link_only":
+            ensure_dir(mapping.repo_path)
 
-        ensure_dir(system_path.parent)
+        elif action == "adopt_repo":
+            remove_path(mapping.system_path)
 
-        if system_existed_before:
-            print(f"Removing the original system directory at {system_path}...")
-            remove_path(system_path)
-            print("Original system directory removed.")
+        ensure_dir(mapping.system_path.parent)
+        print(f"Creating symlink {mapping.system_path} -> {mapping.repo_path}")
+        create_symlink(mapping.system_path, mapping.repo_path)
 
-        print(f"Creating a symlink from {system_path} to {repo_path}...")
-        create_symlink(system_path, repo_path)
-
-        if not system_path.is_symlink() or system_path.resolve() != repo_path.resolve():
+        if not mapping.system_path.is_symlink() or mapping.system_path.resolve() != mapping.repo_path.resolve():
             raise SetupError(
-                f"Created {system_path}, but it does not point to {repo_path}."
+                f"Created {mapping.system_path}, but it does not point to {mapping.repo_path}."
             )
 
-        print("Symlink created successfully.")
+        print("Done.")
         print()
     except Exception as exc:
         print()
@@ -388,49 +645,47 @@ def print_failure_help(root: Path) -> None:
         )
 
 
+def dry_run_summary(mappings: list[AgentMapping]) -> None:
+    print("Dry run summary:")
+    for mapping in mappings:
+        action, description = plan_action(mapping)
+        print(f"- {mapping.name}: {action}")
+        print(f"    {description}")
+    print()
+    print("Dry run complete. No files were changed.")
+
+
 def main() -> int:
     args = parse_args()
     root = repo_root()
-    mappings = build_mappings(root)
+
+    if args.status:
+        print_status(root)
+        return 0
+
+    selection = determine_selection(args, root)
+    mappings = [build_mapping(name, root) for name in selection]
 
     print_intro(root, mappings, dry_run=args.dry_run)
 
     problems = collect_preflight_problems(mappings)
     if problems:
         message_lines = [
-            "Setup can only run when this repo has no pre-existing skills and none of the system skill paths are already symlinks.",
-            "Remove these paths first:",
+            "Setup cannot continue because some paths are in unrecoverable shapes:",
             "",
         ]
         message_lines.extend(f"- {problem}" for problem in problems)
         raise SetupError("\n".join(message_lines))
 
     write_backup_readme(root, mappings, dry_run=args.dry_run)
+    save_selection(root, selection, dry_run=args.dry_run)
 
     if args.dry_run:
-        print("Dry run summary:")
-        for mapping in mappings:
-            if mapping.system_path.exists():
-                print(f"- {mapping.name}: would back up {mapping.system_path}")
-                print(f"  would copy it into {mapping.repo_path}")
-                print(
-                    f"  would replace {mapping.system_path} with a symlink to {mapping.repo_path}"
-                )
-            else:
-                print(f"- {mapping.name}: no existing system directory found")
-                print(f"  would create an empty repo folder at {mapping.repo_path}")
-                print(
-                    f"  would create a symlink at {mapping.system_path} -> {mapping.repo_path}"
-                )
-
-        print()
-        print("Dry run complete. No files were changed.")
+        dry_run_summary(mappings)
         return 0
 
-    print("This script will now work through each agent one at a time.")
-    print(
-        "For each agent, it may create a backup, import the current system skills into this repo, and then swap the system path to a symlink."
-    )
+    print("This script will work through each selected agent one at a time.")
+    print("Already-configured agents are skipped automatically.")
     print()
     confirm_or_exit("Start setup?")
     print()
@@ -439,9 +694,8 @@ def main() -> int:
         setup_agent(mapping, root)
 
     print("Setup complete.")
-    print(f"Backups are stored under {backup_root(root)}.")
-    print("Keep those backups until you have confirmed everything is working.")
-    print(f"Remove the backups with: rm -r {backup_root(root)}")
+    print(f"Backups (if any) are stored under {backup_root(root)}.")
+    print(f"Saved selection: {config_path(root)}")
     return 0
 
 
