@@ -26,7 +26,9 @@ def _read_key(stream) -> str:
         return seq
     seq += nxt
     if nxt == "[":
-        while True:
+        max_escape = 8  # defensive cap against malformed sequences
+        while max_escape > 0:
+            max_escape -= 1
             c = stream.read(1)
             if not c:
                 break
@@ -375,7 +377,10 @@ def write_backup_readme(
         "",
     ]
 
-    for mapping in mappings:
+    backup_mappings = [
+        m for m in mappings if plan_action(m)[0] == "import_and_link"
+    ]
+    for mapping in backup_mappings:
         lines.extend(
             [
                 f"- {mapping.name}",
@@ -385,6 +390,9 @@ def write_backup_readme(
                 "",
             ]
         )
+    if not backup_mappings:
+        lines.append("(No agents require a backup for this run.)")
+        lines.append("")
 
     lines.extend(
         [
@@ -503,6 +511,7 @@ def rollback_agent(
     mapping: AgentMapping,
     root: Path,
     *,
+    action: str,
     repo_existed_before: bool,
     system_existed_before: bool,
 ) -> None:
@@ -515,9 +524,13 @@ def rollback_agent(
         copy_directory(agent_backup, mapping.system_path)
         print(f"Restored the original system directory from {agent_backup}")
 
-    remove_path(mapping.repo_path)
-    if repo_existed_before:
-        ensure_dir(mapping.repo_path)
+    # Only remove repo content when we just created/imported it.
+    # adopt_repo must never delete the repo — the repo contained pre-existing
+    # skills and no backup was made.
+    if action in ("import_and_link", "link_only"):
+        remove_path(mapping.repo_path)
+        if repo_existed_before:
+            ensure_dir(mapping.repo_path)
 
     print(f"Rollback finished for {mapping.name}.")
 
@@ -616,6 +629,7 @@ def setup_agent(mapping: AgentMapping, root: Path) -> None:
             rollback_agent(
                 mapping,
                 root,
+                action=action,
                 repo_existed_before=repo_existed_before,
                 system_existed_before=system_existed_before,
             )
